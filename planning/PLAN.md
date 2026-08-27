@@ -66,7 +66,7 @@ The user runs a single Docker command (or a provided start script). A browser op
 - **Backend**: FastAPI (Python), managed as a `uv` project
 - **Database**: SQLite, single file at `db/finally.db`, volume-mounted for persistence
 - **Real-time data**: Server-Sent Events (SSE) — simpler than WebSockets, one-way server→client push, works everywhere
-- **AI integration**: LiteLLM → OpenRouter (Cerebras for fast inference), with structured outputs for trade execution
+- **AI integration**: LiteLLM → OpenRouter using a free model, with forced tool calling for trade execution
 - **Market data**: Environment-variable driven — simulator by default, real data via Massive API if key provided
 
 ### Why These Choices
@@ -79,6 +79,7 @@ The user runs a single Docker command (or a provided start script). A browser op
 | Single Docker container | Students run one command; no docker-compose for production, no service orchestration |
 | uv for Python | Fast, modern Python project management; reproducible lockfile; what students should learn |
 | Market orders only | Eliminates order book, limit order logic, partial fills — dramatically simpler portfolio math |
+| Free LLM model | The app must cost nothing to run. This rules out paid inference providers, and with them Structured Outputs — hence forced tool calling (§9) |
 
 ---
 
@@ -128,6 +129,10 @@ agents as each component is built.
 # Required: OpenRouter API key for LLM chat functionality
 OPENROUTER_API_KEY=your-openrouter-api-key-here
 
+# Optional: which OpenRouter model to use. Must be a free model (":free" suffix).
+# Defaults to nvidia/nemotron-3.5-lightning:free if unset.
+OPENROUTER_MODEL=openrouter/nvidia/nemotron-3.5-lightning:free
+
 # Optional: Massive (Polygon.io) API key for real market data
 # If not set, the built-in market simulator is used (recommended for most users)
 MASSIVE_API_KEY=
@@ -136,10 +141,15 @@ MASSIVE_API_KEY=
 LLM_MOCK=false
 ```
 
+Variable names are **case-sensitive**. Docker passes `.env` through verbatim with
+`--env-file`, so a lowercase `openrouter_api_key` works on Windows (where Python normalises
+environment keys to uppercase) but fails inside the Linux container. Write them uppercase.
+
 ### Behavior
 
 - If `MASSIVE_API_KEY` is set and non-empty → backend uses Massive REST API for market data
 - If `MASSIVE_API_KEY` is absent or empty → backend uses the built-in market simulator
+- If `OPENROUTER_MODEL` is set → that model is used; otherwise the default free model
 - If `LLM_MOCK=true` → backend returns deterministic mock LLM responses (for E2E tests)
 
 ### Where `.env` Is Read
@@ -418,9 +428,33 @@ Buying a ticker not on the watchlist is allowed; it joins the tracked ticker set
 
 ## 9. LLM Integration
 
-When writing code to make calls to LLMs, use cerebras-inference skill to use LiteLLM via OpenRouter to the `openrouter/openai/gpt-oss-120b` model with Cerebras as the inference provider. Structured Outputs should be used to interpret the results.
+When writing code to make calls to LLMs, use the openrouter-inference skill to call LiteLLM
+via OpenRouter with the free model `openrouter/nvidia/nemotron-3.5-lightning:free`. **Forced
+tool calling** is used to obtain structured results — see below for why.
 
 There is an OPENROUTER_API_KEY in the .env file in the project root.
+
+### Why Tool Calling, Not Structured Outputs
+
+The app must cost nothing to run, which means a model with the `:free` suffix. Free models
+on OpenRouter do not advertise `response_format` among their supported parameters, so
+Structured Outputs are unavailable — but `tools` and `tool_choice` are supported.
+
+The backend therefore defines a single function, `submit_response`, whose parameter schema is
+the response schema below, and forces the model to call it:
+
+```python
+tool_choice={"type": "function", "function": {"name": "submit_response"}}
+```
+
+The arguments come back as JSON that already matches the schema. They are still validated
+with Pydantic before use — a forced tool call is reliable, not guaranteed, and an empty
+`tool_calls` list must be handled rather than indexed into.
+
+This was verified against the model with a spike before being written down: 18 calls across
+three runs, of which forced tool calling produced a schema-valid response 8 times out of 9.
+Prompt-based JSON was also tried and scored 6 out of 6, but was consistently slower in
+head-to-head runs and needs extra parsing to strip code fences that a tool call never has.
 
 ### How It Works
 
@@ -429,15 +463,47 @@ When the user sends a chat message, the backend:
 1. Loads the user's current portfolio context (cash, positions with P&L, watchlist with live prices, total portfolio value)
 2. Loads the **last 20 messages** from the `chat_messages` table — a fixed window, so the prompt cannot grow without bound over a long session
 3. Constructs a prompt with a system message, portfolio context, conversation history, and the user's new message
-4. Calls the LLM via LiteLLM → OpenRouter, requesting structured output, using the cerebras-inference skill
-5. Parses the complete structured JSON response
+4. Calls the LLM via LiteLLM → OpenRouter with a forced `submit_response` tool call, using the openrouter-inference skill
+5. Validates the returned tool-call arguments against the Pydantic response model
 6. Auto-executes any trades or watchlist changes specified in the response, collecting a per-action result (filled / rejected, with the fill price or the error)
 7. Stores the message and the action results in `chat_messages` using the `actions` shape defined in §7
-8. Returns the message plus the action results to the frontend (no token-by-token streaming — Cerebras inference is fast enough that a loading indicator is sufficient)
+8. Returns the message plus the action results to the frontend in one complete JSON response (no token-by-token streaming — see below)
 
-### Structured Output Schema
+### Latency and the Progress Indicator
 
-The LLM is instructed to respond with JSON matching this schema:
+A free endpoint is heavily shared and has no latency guarantee. Measured against this model:
+**7 to 58 seconds per response, median roughly 20-30 seconds.** That is the single biggest
+change from a paid provider and it shapes the UI more than anything else in this section.
+
+The response stays non-streaming. Adding token-by-token streaming would mean an SSE channel
+for chat, partial-JSON handling, and a tool call that cannot be parsed until it is complete
+anyway — real complexity for a first token that still arrives seconds late. Instead the wait
+is made honest rather than hidden:
+
+- The chat panel shows an **elapsed-time counter** from the moment the request is sent, so
+  the user can see the app is working rather than frozen.
+- Alongside it, an explicit expectation: *"Free model — this usually takes 20-30 seconds."*
+  Stating the cost up front turns a broken-feeling wait into an understood one.
+- After **60 seconds**, the message changes to *"Still working — free endpoints are
+  sometimes slow."* The request is not cancelled.
+- After **120 seconds**, the request is abandoned client-side and an error message offers a
+  retry. The backend request keeps its own timeout at the same value.
+- The input is disabled while a request is in flight, so a slow response cannot be
+  compounded by a queue of impatient resends against a 20-per-minute rate limit.
+
+### Rate Limits
+
+Free models allow **20 requests per minute and 50 per day**, rising to 1000 per day once at
+least 10 USD of credit has been purchased on the account. Two consequences: E2E tests must
+run with `LLM_MOCK=true` rather than spend the daily budget, and a demo with several people
+chatting at once can exhaust 50 requests quickly. The daily limit is a property of the
+account, not of this app, and is not something the backend tries to manage — but a 429 from
+OpenRouter must surface as a readable chat error, not a stack trace.
+
+### Response Schema
+
+The parameter schema of the forced `submit_response` tool call. The model's arguments arrive
+as JSON matching this shape:
 
 ```json
 {
@@ -454,6 +520,9 @@ The LLM is instructed to respond with JSON matching this schema:
 - `message` (required): The conversational text shown to the user
 - `trades` (optional): Array of trades to auto-execute. Each trade goes through the same validation as manual trades (sufficient cash for buys, sufficient shares for sells)
 - `watchlist_changes` (optional): Array of watchlist modifications
+
+Defined once as a Pydantic model; `model_json_schema()` supplies the tool's `parameters` and
+the same model validates the response. There is no second, hand-written copy of the schema.
 
 ### Auto-Execution
 
@@ -483,7 +552,10 @@ The LLM should be prompted as "FinAlly, an AI trading assistant" with instructio
 - Execute trades when the user asks or agrees
 - Manage the watchlist proactively
 - Be concise and data-driven in responses
-- Always respond with valid structured JSON
+- Always answer by calling `submit_response`; never reply with plain text
+
+Keep the system prompt short. Every token of it is re-sent on each turn against a shared free
+endpoint, and prompt length is one of the few levers on the latency described above.
 
 ### LLM Mock Mode
 
@@ -502,9 +574,11 @@ the E2E suite needs the chat to actually execute a trade. The rules, in order:
 | `watch <TICKER>` / `add <TICKER>` | `message` confirming, plus a `watchlist_changes` add |
 | anything else | A fixed portfolio-summary message, no actions |
 
-The mock returns the structured object only. It performs no execution and no validation of
-its own — the response flows through the same auto-execution path as a real one, so an E2E
-test can assert on a genuine rejection by mocking a buy the cash balance cannot cover.
+The mock returns the response object directly, replacing the network call but not the
+validation or execution that follows it. The response flows through the same auto-execution
+path as a real one, so an E2E test can assert on a genuine rejection by mocking a buy the
+cash balance cannot cover. Mock responses are instant, so the progress indicator never
+appears in E2E runs — it needs its own frontend unit test with a delayed promise.
 
 ---
 
@@ -521,7 +595,7 @@ The frontend is a single-page application with a dense, terminal-inspired layout
 - **Positions table** — tabular view of all positions: ticker, quantity, avg cost, current price, unrealized P&L, % change
 - **Trade blotter** — scrolling log of executed trades, newest first: time, ticker, side (green BUY / red SELL), quantity, fill price, notional value. Fed by `GET /api/trades` and refetched after every trade, manual or AI-executed. Read-only — trades cannot be cancelled or amended.
 - **Trade bar** — simple input area: ticker field, quantity field, buy button, sell button. Market orders, instant fill. A rejected trade (§8) surfaces its error string beside the bar.
-- **AI chat panel** — docked/collapsible sidebar. Message input, scrolling conversation history, loading indicator while waiting for LLM response. Each message's executed actions render as green (filled) or red (rejected) chips beneath the message text, per §9.
+- **AI chat panel** — docked/collapsible sidebar. Message input, scrolling conversation history, and the progress indicator described below while waiting for the LLM. Each message's executed actions render as green (filled) or red (rejected) chips beneath the message text, per §9.
 - **Header** — portfolio total value (updating live), connection status indicator, cash balance
 
 ### Technical Notes
@@ -534,6 +608,31 @@ The frontend is a single-page application with a dense, terminal-inspired layout
 - **Connection dot**: track the timestamp of the last SSE message. Green if it is under 10 seconds old, red otherwise. Two states only (§2).
 - All API calls go to the same origin (`/api/*`) — no CORS configuration needed
 - Tailwind CSS for styling with a custom dark theme
+
+### Chat Progress Indicator
+
+The free model takes 7-58 seconds to answer (§9). A bare spinner over that span reads as a
+hung app, so the panel states the cost of being free instead of hiding it. A placeholder
+assistant bubble appears the moment the message is sent and passes through four stages:
+
+| Elapsed | What the user sees |
+|---|---|
+| 0s | Animated dots, an elapsed-second counter, and the line *"Free model — this usually takes 20-30 seconds."* |
+| 60s | Counter continues; the line becomes *"Still working — free endpoints are sometimes slow."* |
+| 120s | Request abandoned. The bubble becomes an error with a **Retry** button that resends the same message. |
+| Response | The bubble is replaced by the real message and its action chips. |
+
+Requirements:
+
+- The elapsed counter must tick visibly from the first second. It is the only honest signal
+  that something is still happening, and it costs one `setInterval`.
+- The message input is **disabled while a request is in flight**. Without this, an impatient
+  user resends and burns the 20-requests-per-minute budget on answers they will discard.
+- The user's own message appears in the history immediately, not after the response arrives.
+- Never show a fake progress bar. There is no progress to report — an elapsed counter is
+  truthful, a bar that fills at a guessed rate is not.
+- A 429 from OpenRouter renders as a readable chat error naming the rate limit, not a
+  generic failure.
 
 ### Client-Side Price History
 
@@ -641,7 +740,7 @@ The container is designed to deploy to AWS App Runner, Render, or any container 
 - Market data: simulator generates valid prices, GBM math is correct, Massive API response parsing works, both implementations conform to the abstract interface, an unseeded ticker gets a fallback seed price, `change_percent_from_close` is computed against `prev_close`
 - Portfolio: trade execution logic, P&L calculations, edge cases (selling more than owned, buying with insufficient cash, selling at a loss, a fully-sold position row is deleted, quantity <= 0 is rejected)
 - Tracked ticker set: removing a watchlist ticker with an open position keeps it priced; removing one without a position stops pricing it
-- LLM: structured output parsing handles all valid schemas, graceful handling of malformed responses, trade validation within chat flow, a rejected trade still produces a well-formed `actions` object
+- LLM: tool-call arguments validate against the Pydantic model, an empty `tool_calls` list is handled rather than indexed into, malformed arguments fail gracefully, trade validation within chat flow, a rejected trade still produces a well-formed `actions` object, a 429 surfaces as a readable error
 - API routes: correct status codes, response shapes, error handling, watchlist idempotency and the 30-ticker cap, `/api/trades` ordering (newest first) and `limit` handling
 - Blotter integrity: a rejected trade writes no row; an AI-executed trade writes one indistinguishable from a manual trade
 - Startup: simulator mode truncates `portfolio_snapshots` and leaves positions, cash, trades and watchlist untouched; Massive mode leaves snapshots intact
@@ -651,7 +750,7 @@ The container is designed to deploy to AWS App Runner, Render, or any container 
 - Price flash animation triggers correctly on price changes
 - Watchlist CRUD operations
 - Portfolio display calculations
-- Chat message rendering and loading state
+- Chat message rendering, and the progress indicator's four stages driven by a delayed promise: counter ticks, the 60s text change, the 120s abandon with a working Retry, and the input staying disabled throughout
 
 ### E2E Tests (in `test/`)
 
@@ -708,6 +807,22 @@ lost and the same questions are not reopened.
 | 23 | `LLM_MOCK` responses were "deterministic" but unspecified | Keyword-matched on the user's message with a documented rule table, so E2E tests can drive real fills *and* real rejections | §9 |
 | 24 | "Lightweight Charts **or** Recharts" left the choice open | Recharts for all four chart types. It is the only candidate that covers the treemap, so the app carries one charting dependency instead of two | §10 |
 | 25 | `backend/db/` and `/db` were two directories named `db` | Renamed to `backend/app/database/`, alongside `backend/app/market/` | §4 |
+
+### Switched to a free LLM (later change)
+
+Cerebras was dropped because it costs money; the app must run for free. This was not part of
+the original review, but it changed enough of §9 to belong in the same log.
+
+| # | Question | Decision | Where |
+|---|---|---|---|
+| 26 | Cerebras is a paid inference provider | Removed. No provider pinning at all — `extra_body={"provider": ...}` is exactly what routes a request to a paid provider | §3, §9 |
+| 27 | The requested model `nvidia/nemotron-3-ultra-550b-a55b:free` does not exist on OpenRouter | Verified against the live model list and replaced with `nvidia/nemotron-3.5-lightning:free` | §5, §9 |
+| 28 | Free models do not support `response_format`, which §9 depended on | Forced tool calling via `tools` + `tool_choice`, which free models do support. Verified by spike: 8/9 schema-valid calls, against 6/6 for prompt-based JSON but consistently slower and needing fence-stripping | §9 |
+| 29 | "Cerebras is fast enough that a loading indicator is sufficient" no longer holds — measured 7-58s | Response stays non-streaming, but the wait is made honest: elapsed counter, a stated 20-30s expectation, new text at 60s, abandon with Retry at 120s, input disabled throughout | §9, §10, §12 |
+| 30 | Free models are rate-limited to 20/min and 50/day | Documented. E2E runs on `LLM_MOCK=true`; a 429 must render as a readable chat error | §9 |
+| 31 | The model was hardcoded in the plan | `OPENROUTER_MODEL` environment variable, defaulting to the free model, so swapping models needs no code change | §5 |
+| 32 | Environment variable names are case-sensitive in the Linux container | Documented — a lowercase `openrouter_api_key` works on Windows but fails in Docker | §5 |
+| 33 | The `cerebras-inference` skill named a provider that is no longer used | Renamed to `openrouter-inference`, with the tool-calling snippet, the latency warning and the rate limits | — |
 
 ### Also simplified
 
